@@ -131,7 +131,7 @@ class TaskInfoDiscoverer:
         self.container_instance_cache.flip()
         self.ec2_instance_cache.flip()
 
-    def describe_tasks(self, cluster_arn, task_arns):
+    def describe_tasks(self, cluster_arn, task_arns, service_arn):
         def fetcher_task_definition(arn):
             response = self.ecs_client.describe_task_definition(
                 taskDefinition=arn,
@@ -202,12 +202,13 @@ class TaskInfoDiscoverer:
                             tasks[task["taskArn"]] = task
                     else:
                         tasks[task["taskArn"]] = task
+            tasks[task["taskArn"]]["service"]=service_arn
             return tasks
 
         return self.task_cache.get_dict(task_arns, fetcher).values()
 
-    def create_task_infos(self, cluster_arn, task_arns):
-        return map(lambda t: TaskInfo(t), self.describe_tasks(cluster_arn, task_arns))
+    def create_task_infos(self, cluster_arn, task_arns, service_arn):
+        return map(lambda t: TaskInfo(t), self.describe_tasks(cluster_arn, task_arns, service_arn))
 
     def add_task_definitions(self, task_infos):
         def fetcher(arn):
@@ -263,16 +264,21 @@ class TaskInfoDiscoverer:
             )
 
     def get_infos_for_cluster(self, cluster_arn, launch_type):
-        tasks_pages = self.ecs_client.get_paginator("list_tasks").paginate(
-            cluster=cluster_arn, launchType=launch_type
+        service_pages = self.ecs_client.get_paginator('list_services').paginate(
+            cluster=cluster_arn
         )
         task_infos = []
-        for task_arns in tasks_pages:
-            if task_arns["taskArns"]:
-                task_infos += self.create_task_infos(cluster_arn, task_arns["taskArns"])
-        self.add_task_definitions(task_infos)
-        if "EC2" in launch_type:
-            self.add_container_instances(task_infos, cluster_arn)
+        for service_arns in service_pages:
+            for service_arn in service_arns["serviceArns"]:
+                tasks_pages = self.ecs_client.get_paginator("list_tasks").paginate(
+                    cluster=cluster_arn, launchType=launch_type, serviceName=service_arn
+                )
+                for task_arns in tasks_pages:
+                    if task_arns["taskArns"]:
+                        task_infos += self.create_task_infos(cluster_arn, task_arns["taskArns"], service_arn)
+                self.add_task_definitions(task_infos)
+                if "EC2" in launch_type:
+                    self.add_container_instances(task_infos, cluster_arn)
         return task_infos
 
     def print_cache_stats(self):
@@ -325,6 +331,7 @@ class Target:
         p_instance,
         ecs_task_id,
         ecs_task_name,
+        ecs_service_name,
         ecs_task_version,
         ecs_container_id,
         ecs_cluster_name,
@@ -337,6 +344,7 @@ class Target:
         self.p_instance = p_instance
         self.ecs_task_id = ecs_task_id
         self.ecs_task_name = ecs_task_name
+        self.ecs_service_name = ecs_service_name
         self.ecs_task_version = ecs_task_version
         self.ecs_container_id = ecs_container_id
         self.ecs_cluster_name = ecs_cluster_name
@@ -419,6 +427,7 @@ def task_info_to_targets(task_info):
 
         for container in running_containers:
             ecs_task_name = extract_name_from_arn(task["taskDefinitionArn"])
+            ecs_service_name = extract_name_from_arn(task["service"])
             has_host_port_mapping = (
                 "portMappings" in container_definition
                 and len(container_definition["portMappings"]) > 0
@@ -481,6 +490,7 @@ def task_info_to_targets(task_info):
                     p_instance=p_instance,
                     ecs_task_id=ecs_task_id,
                     ecs_task_name=ecs_task_name,
+                    ecs_service_name=ecs_service_name,
                     ecs_task_version=ecs_task_version,
                     ecs_container_id=ecs_container_id,
                     ecs_cluster_name=ecs_cluster_name,
@@ -544,7 +554,8 @@ class Main:
                     "targets": [target.ip + ":" + target.port],
                     "labels": {
                         "instance": target.p_instance,
-                        "job": target.ecs_task_name,
+                        "job": target.ecs_service_name,
+                        "task_definition":target.ecs_task_name,
                         "metrics_path": path,
                     },
                 }
